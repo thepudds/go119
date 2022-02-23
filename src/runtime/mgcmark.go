@@ -1250,6 +1250,13 @@ func scanobject(b uintptr, gcw *gcWork) {
 		throw("scanobject n == 0")
 	}
 
+	if s.didUnmap {
+		// This check is not strictly needed, since the GC will get a seg
+		// fault below when scanning the object in the unmapped arena.
+		println("scanning unmapped obj", unsafe.Pointer(b))
+		throw("fail")
+	}
+
 	if n > maxObletBytes {
 		// Large object. Break into oblets for better
 		// parallelism and lower latency.

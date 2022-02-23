@@ -551,6 +551,9 @@ var depsRules = `
 
 	FMT, container/heap, math/rand
 	< internal/trace;
+
+	reflect
+	< arena;
 `
 
 // listStdPkgs returns the same list of packages as "go list std".

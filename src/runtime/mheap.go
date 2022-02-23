@@ -214,6 +214,11 @@ type mheap struct {
 	speciallock           mutex    // lock for special record allocators.
 	arenaHintAlloc        fixalloc // allocator for arenaHints
 
+	userArenaHints *arenaHint
+	userArena      struct {
+		base, end uintptr
+	}
+
 	unused *specialfinalizer // never set, just here to force the specialfinalizer type into DWARF
 }
 
@@ -290,6 +295,11 @@ type heapArena struct {
 	//
 	// Read atomically and written with an atomic CAS.
 	zeroedBase uintptr
+	next       *heapArena // Next arena in heapArenaCheckList
+	bitsSize   uint32     // Bytes of GC bits we need to clear before reusing arena
+	freetime   int64      // When this arena was freed in unsafe_unmapUserArenaChunk
+	userArena  bool       // True if this arena is a chunk of a user arena
+	didUnmap   bool       // True if we've unmapped the memory associated with this arena
 }
 
 // arenaHint is a hint for where to grow the heap arenas. See
@@ -459,6 +469,9 @@ type mspan struct {
 	limit       uintptr       // end of data in span
 	speciallock mutex         // guards specials list
 	specials    *special      // linked list of special records sorted by offset.
+	freecycle   uint32        // GC cycle when arena was unmapped
+	userArena   bool          // span represents a user arena chunk and covers a full heap arena
+	didUnmap    bool          // address range of user arena chunk has been unmapped
 }
 
 func (s *mspan) base() uintptr {
@@ -885,11 +898,12 @@ const (
 	spanAllocStack                              // stack span
 	spanAllocPtrScalarBits                      // unrolled GC prog bitmap span
 	spanAllocWorkBuf                            // work buf span
+	spanAllocUserArena                          // user arena
 )
 
 // manual returns true if the span allocation is manually managed.
 func (s spanAllocType) manual() bool {
-	return s != spanAllocHeap
+	return s != spanAllocHeap && s != spanAllocUserArena
 }
 
 // alloc allocates a new span of npage pages from the GC'd heap.
@@ -1164,17 +1178,24 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 
 	if base == 0 {
 		// Try to acquire a base address.
-		base, scav = h.pages.alloc(npages)
-		if base == 0 {
-			var ok bool
-			growth, ok = h.grow(npages)
-			if !ok {
-				unlock(&h.lock)
-				return nil
-			}
+		if typ == spanAllocUserArena {
+			// Allocate from special address range, and don't bother
+			// allocating page info.
+			base = h.userArenaGrow(npages)
+			scav = npages * pageSize
+		} else {
 			base, scav = h.pages.alloc(npages)
 			if base == 0 {
-				throw("grew heap, but no adequate free space found")
+				var ok bool
+				growth, ok = h.grow(npages)
+				if !ok {
+					unlock(&h.lock)
+					return nil
+				}
+				base, scav = h.pages.alloc(npages)
+				if base == 0 {
+					throw("grew heap, but no adequate free space found")
+				}
 			}
 		}
 	}
@@ -1225,6 +1246,9 @@ HaveSpan:
 	// At this point, both s != nil and base != 0, and the heap
 	// lock is no longer held. Initialize the span.
 	s.init(base, npages)
+	if typ == spanAllocUserArena {
+		s.userArena = true
+	}
 	if h.allocNeedsZero(base, npages) {
 		s.needzero = 1
 	}
@@ -1280,7 +1304,7 @@ HaveSpan:
 		atomic.Xadd64(&memstats.heap_released, -int64(scav))
 	}
 	// Update stats.
-	if typ == spanAllocHeap {
+	if typ == spanAllocHeap || typ == spanAllocUserArena {
 		atomic.Xadd64(&memstats.heap_inuse, int64(nbytes))
 	}
 	if typ.manual() {
@@ -1292,7 +1316,7 @@ HaveSpan:
 	atomic.Xaddint64(&stats.committed, int64(scav))
 	atomic.Xaddint64(&stats.released, -int64(scav))
 	switch typ {
-	case spanAllocHeap:
+	case spanAllocHeap, spanAllocUserArena:
 		atomic.Xaddint64(&stats.inHeap, int64(nbytes))
 	case spanAllocStack:
 		atomic.Xaddint64(&stats.inStacks, int64(nbytes))
@@ -1355,7 +1379,7 @@ func (h *mheap) grow(npage uintptr) (uintptr, bool) {
 		// Not enough room in the current arena. Allocate more
 		// arena space. This may not be contiguous with the
 		// current arena, so we have to request the full ask.
-		av, asize := h.sysAlloc(ask)
+		av, asize := h.sysAlloc(ask, false)
 		if av == nil {
 			print("runtime: out of memory: cannot allocate ", ask, "-byte block (", memstats.heap_sys, " in use)\n")
 			return 0, false
@@ -1469,6 +1493,12 @@ func (h *mheap) freeSpanLocked(s *mspan, typ spanAllocType) {
 			throw("mheap.freeSpanLocked - invalid stack free")
 		}
 	case mSpanInUse:
+		if s.userArena {
+			if s.allocCount != 0 {
+				throw("mheap.freeSpanLocked - invalid user arena free")
+			}
+			break
+		}
 		if s.allocCount != 0 || s.sweepgen != h.sweepgen {
 			print("mheap.freeSpanLocked - span ", s, " ptr ", hex(s.base()), " allocCount ", s.allocCount, " sweepgen ", s.sweepgen, "/", h.sweepgen, "\n")
 			throw("mheap.freeSpanLocked - invalid free")
@@ -1484,7 +1514,8 @@ func (h *mheap) freeSpanLocked(s *mspan, typ spanAllocType) {
 
 	// Update stats.
 	//
-	// Mirrors the code in allocSpan.
+	// Mirrors the code in allocSpan except
+	// for spanAllocUserArena which is handled separately.
 	nbytes := s.npages * pageSize
 	if typ == spanAllocHeap {
 		atomic.Xadd64(&memstats.heap_inuse, -int64(nbytes))
@@ -1507,8 +1538,13 @@ func (h *mheap) freeSpanLocked(s *mspan, typ spanAllocType) {
 	}
 	memstats.heapStats.release()
 
-	// Mark the space as free.
-	h.pages.free(s.base(), s.npages, false)
+	if s.userArena {
+		// We didn't allocate any page info for user arena chunks
+		s.userArena = false
+	} else {
+		// Mark the space as free.
+		h.pages.free(s.base(), s.npages, false)
+	}
 
 	// Free the span structure. We no longer have a use for it.
 	s.state.set(mSpanDead)

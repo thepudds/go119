@@ -353,6 +353,14 @@ func sweepone() uintptr {
 			noMoreWork = sweep.active.markDrained()
 			break
 		}
+		if s.userArena && s.didUnmap {
+			// Drop spans for user arena chunks from sweeping once
+			// they are unmapped. The spans will be recycles after the
+			// second sweep cycle. We must sweep user arena chunks
+			// before unmapping, because sweeping is required for
+			// continued scanning.
+			continue
+		}
 		if state := s.state.get(); state != mSpanInUse {
 			// This can happen if direct sweeping already
 			// swept this span, but in that case the sweep
@@ -710,7 +718,11 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				s.limit = 0 // prevent mlookup from finding this span
 				sysFault(unsafe.Pointer(s.base()), size)
 			} else {
-				mheap_.freeSpan(s)
+				if s.userArena {
+					panic("Arena was not freed properly")
+				} else {
+					mheap_.freeSpan(s)
+				}
 			}
 			stats := memstats.heapStats.acquire()
 			atomic.Xadduintptr(&stats.largeFreeCount, 1)
