@@ -55,6 +55,48 @@ func TestLarge(t *testing.T) {
 	a.Free()
 }
 
+type node struct {
+	left  *node
+	right *node
+	i     int
+}
+
+func TestNewOfSmoke(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skipf("Only supporting linux-amd64")
+	}
+	a := arena.New()
+	defer a.Free()
+
+	n := arena.NewOf[node](a)
+	left := arena.NewOf[node](a)
+	n.left = left
+}
+
+func TestNewOfMany(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skipf("Only supporting linux-amd64")
+	}
+
+	for i := 0; i < 128; i++ {
+		a := arena.New()
+		for alloc := 0; alloc < 1<<20; alloc += int(unsafe.Sizeof(node{})) {
+			n := arena.NewOf[node](a)
+			n.i = 1
+		}
+		a.Free()
+	}
+
+	for i := 0; i < 4; i++ {
+		a := arena.New()
+		for alloc := 0; alloc < 1<<27; alloc += int(unsafe.Sizeof(node{})) {
+			n := arena.NewOf[node](a)
+			n.i = 1
+		}
+		a.Free()
+	}
+}
+
 func TestHeapString(t *testing.T) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		t.Skipf("Only supporting linux-amd64")

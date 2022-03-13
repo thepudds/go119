@@ -43,6 +43,21 @@ func (a *Arena) New(objPtrPtr interface{}) {
 	ptrValue.Set(reflect.ValueOf(reflect_arenaNew(a.a, ptrValue.Type().Elem())))
 }
 
+// NewOf allocates an object of type T from arena a.
+// The object must not be accessed after arena a is freed.
+func NewOf[T any](a *Arena) *T {
+	// thepudds: this is temporary generics API.
+	// A real version could hook in lower, but this is
+	// intended to be a simple change for testing.
+	typ := typeOf[T]()
+	eface := reflect_arenaNew(a.a, typ)
+	return eface.(*T)
+}
+
+func typeOf[T any]() reflect.Type {
+	return reflect.TypeOf((*T)(nil)).Elem()
+}
+
 // NewReflectType allocates an object of type typ from arena a. It is an alternate
 // API taking a reflect.Type argument to specify the type.
 func (a *Arena) NewReflectType(typ reflect.Type) interface{} {
