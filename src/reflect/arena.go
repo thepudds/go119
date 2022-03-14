@@ -213,7 +213,22 @@ func (a *arena) reservePointer(size uintptr, align uint8) unsafe.Pointer {
 	}
 	chunk.off = off + size
 	chunk.size = s - size
-	return add(unsafe.Pointer(chunk), off+pad, "intra-arena")
+	alignedOff := off + pad
+	p := add(unsafe.Pointer(chunk), alignedOff, "intra-arena")
+	if alignedOff&(1<<21-1) == 0 || alignedOff>>21 != (chunk.off-1)>>21 {
+		// thepudds: in some cases, we were not getting huge pages
+		// backing user arenas on linux. Touching the pages prior
+		// to returning individual pointers to the user seems
+		// to result in huge pages, which can have material performance
+		// impact. To reduce the hit on RSS, we touch in 2MB pieces.
+		// Here, we are at the start of a 2MB piece of the 64MB arena chunk,
+		// or the ptr we are about to return straddles a 2MB boundary.
+		if alignedOff+(1<<21) > 1<<26 {
+			panic("memclr beyond arena chunk size")
+		}
+		memclrNoHeapPointers(p, 1<<21) // 2MB
+	}
+	return p
 }
 
 func (a *arena) reserveScalar(size uintptr, align uint8) unsafe.Pointer {

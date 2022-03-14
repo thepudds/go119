@@ -498,6 +498,18 @@ func (h *mheap) userArenaGrow(npages uintptr) uintptr {
 		// Unlike (*mheap).grow, just map in everything that we
 		// asked for. We're likely going to use it all.
 		sysMap(av, asize, &memstats.heap_sys)
+
+		// thepudds: in some cases, we were not getting huge pages
+		// backing user arenas on linux. Touching the pages prior
+		// to returning individual pointers to the user seems
+		// to result in huge pages, which can have material performance
+		// impact. To reduce the hit on RSS, we touch in 2MB pieces.
+		// Here, we do the first 2MB of this arena chunk.
+		if asize < 1<<21 {
+			throw("unexpectedly small user arena")
+		}
+		memclrNoHeapPointers(av, 1<<21) // 2 MB
+
 		if uintptr(av) == h.userArena.end {
 			h.userArena.end = uintptr(av) + asize
 		} else {
