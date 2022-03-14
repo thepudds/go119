@@ -157,14 +157,22 @@ func newArena() *arena {
 func freeArena(a *arena) {
 	runtime.SetFinalizer(a, nil)
 
-	// Skip the active arena chunk, see if there are any completed blocks
-	p := a.chunkListHead.next
-	a.chunkListHead.next = nil
-
-	if nofree {
+	freeAll := !nofree && a.chunkListHead.off >= 1<<23 // 8 MB
+	var p *arenaChunkHeader
+	switch {
+	case freeAll:
+		// thepudds: we have used some of the active arena chunk beyond our threshold of 8MB.
+		// Free it even if it is not yet full along with any other chunks for this arena.
+		// This helps reduce our RSS at a modest cost of CPU compared to waiting for a full 64MB.
+		p = a.chunkListHead
+	case nofree:
 		// Instead of freeing/unmapping the full chunks, just drop a
 		// pointer to them so they will get reclaimed by GC.
 		p = nil
+	default:
+		// Skip the active arena chunk, see if there are any completed blocks
+		p = a.chunkListHead.next
+		a.chunkListHead.next = nil
 	}
 
 	for p != nil {
@@ -179,13 +187,15 @@ func freeArena(a *arena) {
 		p = next
 	}
 
-	mu.Lock()
-	// Save the current unfull chunk on the free chunk list
-	a.chunkListHead.lastP = uintptr(unsafe_myP())
-	a.chunkListHead.next = arenaFreeChunks
-	arenaFreeChunks = a.chunkListHead
-	arenaFreeCount++
-	mu.Unlock()
+	if !freeAll {
+		mu.Lock()
+		// Save the current unfull chunk on the free chunk list
+		a.chunkListHead.lastP = uintptr(unsafe_myP())
+		a.chunkListHead.next = arenaFreeChunks
+		arenaFreeChunks = a.chunkListHead
+		arenaFreeCount++
+		mu.Unlock()
+	}
 }
 
 var zeroBase uint64
